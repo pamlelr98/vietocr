@@ -29,14 +29,12 @@ class VietOCR(nn.Module):
         else:
             raise ("Not Support Seq Model")
 
-    def forward(self, img, tgt_input, tgt_key_padding_mask):
-        """
-        Shape:
-            - img: (N, C, H, W)
-            - tgt_input: (T, N)
-            - tgt_key_padding_mask: (N, T)
-            - output: b t v
-        """
+    def forward(self, batch):
+        # Giải nén dictionary bên trong hàm forward
+        img = batch['img']
+        tgt_input = batch['tgt_input']
+        # Dùng .get() để an toàn nếu key không tồn tại
+        tgt_key_padding_mask = batch.get('tgt_padding_mask', None)
         src = self.cnn(img)
 
         if self.seq_modeling == "transformer":
