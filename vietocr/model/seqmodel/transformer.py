@@ -32,46 +32,39 @@ class LanguageTransformer(nn.Module):
             num_decoder_layers,
             dim_feedforward,
             trans_dropout,
+            batch_first=True 
         )
 
         self.fc = nn.Linear(d_model, vocab_size)
 
-    def forward(
-        self,
-        src,
-        tgt,
-        src_key_padding_mask=None,
-        tgt_key_padding_mask=None,
-        memory_key_padding_mask=None,
-    ):
-        """
-        Shape:
-            - src: (W, N, C)
-            - tgt: (T, N)
-            - src_key_padding_mask: (N, S)
-            - tgt_key_padding_mask: (N, T)
-            - memory_key_padding_mask: (N, S)
-            - output: (N, T, E)
+    def forward(self, src, tgt, src_key_padding_mask=None, tgt_key_padding_mask=None, memory_key_padding_mask=None):
+        # src từ CNN có shape: (Width, Batch, Channels)
+        # tgt từ dataloader có shape: (Batch, Target_Length)
 
-        """
-        tgt_mask = self.gen_nopeek_mask(tgt.shape[0]).to(src.device)
+        # Xử lý embedding và positional encoding
+        # Giả sử src và tgt đã được qua embedding và positional encoding ở đây
+        # Ví dụ:
+        # src = self.pos_encoder(self.encoder(src)) # Vẫn giữ nguyên (W, B, C)
+        # tgt = self.pos_decoder(self.tgt_embed(tgt)) # Ra shape (B, L, C)
+        
+        # THAY ĐỔI 2: Hoán vị chiều của src
+        # Chuyển src từ (Width, Batch, Channels) -> (Batch, Width, Channels)
+        # để khớp với yêu cầu của `batch_first=True`
+        src = src.permute(1, 0, 2)
+        
+        # Tạo target mask nếu cần
+        # tgt_mask = self.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)
 
-        src = self.pos_enc(src * math.sqrt(self.d_model))
-        #        src = self.learned_pos_enc(src*math.sqrt(self.d_model))
-
-        tgt = self.pos_enc(self.embed_tgt(tgt) * math.sqrt(self.d_model))
-
+        # Gọi module Transformer
         output = self.transformer(
-            src,
-            tgt,
-            tgt_mask=tgt_mask,
+            src, tgt,
+            # tgt_mask=tgt_mask, # Bỏ comment nếu bạn có dùng
             src_key_padding_mask=src_key_padding_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask.float(),
-            memory_key_padding_mask=memory_key_padding_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask
         )
-        #        output = rearrange(output, 't n e -> n t e')
-        output = output.transpose(0, 1)
-        return self.fc(output)
+
+        return output
 
     def gen_nopeek_mask(self, length):
         mask = (torch.triu(torch.ones(length, length)) == 1).transpose(0, 1)
