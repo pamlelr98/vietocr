@@ -148,6 +148,7 @@ class ClusterRandomSampler(Sampler):
         self.data_source = data_source
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.drop_last = True
 
     def flatten_list(self, lst):
         return [item for sublist in lst for item in sublist]
@@ -162,7 +163,13 @@ class ClusterRandomSampler(Sampler):
                 cluster_indices[i : i + self.batch_size]
                 for i in range(0, len(cluster_indices), self.batch_size)
             ]
-            batches = [_ for _ in batches if len(_) == self.batch_size]
+
+            # Bỏ đi batch cuối nếu drop_last là True
+            if self.drop_last and len(batches[-1]) < self.batch_size:
+                batches = batches[:-1]
+            else:
+                batches = [_ for _ in batches if len(_) == self.batch_size]
+
             if self.shuffle:
                 random.shuffle(batches)
 

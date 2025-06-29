@@ -32,7 +32,14 @@ class Trainer:
         self.config = config
         self.model, self.vocab = build_model(config)
 
+        # Thêm các dòng sau để kiểm tra và sử dụng DataParallel
+        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        if torch.cuda.device_count() > 1:
+            print("Let's use", torch.cuda.device_count(), "GPUs!")
+            self.model = nn.DataParallel(self.model)
+
         self.device = config["device"]
+        self.model.to(self.device)
         self.num_iters = config["trainer"]["iters"]
         self.beamsearch = config["predictor"]["beamsearch"]
 
