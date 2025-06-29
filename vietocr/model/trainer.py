@@ -1,427 +1,225 @@
-from vietocr.optim.optim import ScheduledOptim
-from vietocr.optim.labelsmoothingloss import LabelSmoothingLoss
-from torch.optim import Adam, SGD, AdamW
-from torch import nn
-from vietocr.tool.translate import build_model
-from vietocr.tool.translate import translate, batch_translate_beam_search
-from vietocr.tool.utils import download_weights
-from vietocr.tool.logger import Logger
-from vietocr.loader.aug import ImgAugTransformV2
-
-import yaml
 import torch
-from vietocr.loader.dataloader_v1 import DataGen
-from vietocr.loader.dataloader import OCRDataset, ClusterRandomSampler, Collator
-from torch.utils.data import DataLoader
-from einops import rearrange
-from torch.optim.lr_scheduler import CosineAnnealingLR, CyclicLR, OneCycleLR
-
-import torchvision
-
-from vietocr.tool.utils import compute_accuracy
-from PIL import Image
-import numpy as np
 import os
-import matplotlib.pyplot as plt
-import time
+from tqdm.auto import tqdm
+import torch.distributed as dist
+from collections import OrderedDict
 
+from vietocr.tool.logger import get_logger
+from vietocr.tool.utils import download_file
 
-class Trainer:
-    def __init__(self, config, pretrained=True, augmentor=ImgAugTransformV2()):
-
+class Trainer():
+    def __init__(self, config, model, optimizer, criterion, local_rank=-1):
         self.config = config
-        self.model, self.vocab = build_model(config)
+        self.model = model
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.local_rank = local_rank
+        self.is_distributed = local_rank != -1
+        self.is_main_process = local_rank in [-1, 0]
+        self.device = config['device']
 
-        self.device = config["device"]
-        self.num_iters = config["trainer"]["iters"]
-        self.beamsearch = config["predictor"]["beamsearch"]
+        self.epoch = 1
+        self.step = 0
+        self.best_acc = 0
+        self.metrics = {}
+        
+        # Thiết lập logger chỉ cho process chính
+        if self.is_main_process:
+            self.checkpoint_dir = os.path.join(config['trainer']['checkpoint_dir'], config['experiment_name'])
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+            self.logger = get_logger(os.path.join(self.checkpoint_dir, 'train.log'))
+            self.logger.info('Created checkpoint directory: %s' % self.checkpoint_dir)
+            self.logger.info('Loaded config: \n%s' % open(config['config_path']).read())
 
-        self.data_root = config["dataset"]["data_root"]
-        self.train_annotation = config["dataset"]["train_annotation"]
-        self.valid_annotation = config["dataset"]["valid_annotation"]
-        self.dataset_name = config["dataset"]["name"]
+    def train(self, train_loader, valid_loader):
+        if self.is_main_process:
+            self.logger.info('Start training...')
 
-        self.batch_size = config["trainer"]["batch_size"]
-        self.print_every = config["trainer"]["print_every"]
-        self.valid_every = config["trainer"]["valid_every"]
+        for self.epoch in range(self.epoch, self.config['trainer']['epochs'] + 1):
+            
+            # Thiết lập epoch cho sampler để đảm bảo shuffle khác nhau mỗi epoch
+            if self.is_distributed:
+                train_loader.sampler.set_epoch(self.epoch)
 
-        self.image_aug = config["aug"]["image_aug"]
-        self.masked_language_model = config["aug"]["masked_language_model"]
+            self.train_one_epoch(train_loader)
 
-        self.checkpoint = config["trainer"]["checkpoint"]
-        self.export_weights = config["trainer"]["export"]
-        self.metrics = config["trainer"]["metrics"]
-        logger = config["trainer"]["log"]
+            # Chỉ process chính thực hiện validation và lưu model
+            if self.is_main_process:
+                self.logger.info('Epoch: %d' % self.epoch)
+                self.validate(valid_loader)
 
-        if logger:
-            self.logger = Logger(logger)
+                if self.metrics['full_seq_acc'] > self.best_acc:
+                    self.best_acc = self.metrics['full_seq_acc']
+                    self.save(os.path.join(self.checkpoint_dir, 'best_acc.pth'))
+                
+                self.save(os.path.join(self.checkpoint_dir, 'last.pth'))
+                self.logger.info('Best acc: %.4f' % self.best_acc)
 
-        if pretrained:
-            weight_file = download_weights(config["pretrain"], quiet=config["quiet"])
-            self.load_weights(weight_file)
+            # Chờ tất cả các process đồng bộ trước khi bắt đầu epoch mới
+            if self.is_distributed:
+                dist.barrier()
 
-        self.iter = 0
+    def train_one_epoch(self, train_loader):
+        self.model.train()
+        
+        pbar = tqdm(total=len(train_loader), desc="Train", disable=not self.is_main_process)
+        
+        for i, batch in enumerate(train_loader):
+            self.step += 1
+            
+            img = batch['image'].to(self.device, non_blocking=True)
+            tgt_input = batch['tgt_input'].to(self.device, non_blocking=True)
+            tgt_output = batch['tgt_output'].to(self.device, non_blocking=True)
+            tgt_padding_mask = batch['tgt_padding_mask'].to(self.device, non_blocking=True)
 
-        self.optimizer = AdamW(self.model.parameters(), betas=(0.9, 0.98), eps=1e-09)
-        self.scheduler = OneCycleLR(
-            self.optimizer, total_steps=self.num_iters, **config["optimizer"]
-        )
-        #        self.optimizer = ScheduledOptim(
-        #            Adam(self.model.parameters(), betas=(0.9, 0.98), eps=1e-09),
-        #            #config['transformer']['d_model'],
-        #            512,
-        #            **config['optimizer'])
+            outputs = self.model(img, tgt_input, tgt_padding_mask)
+            
+            outputs = outputs.view(-1, outputs.size(2))
+            tgt_output = tgt_output.view(-1)
+            
+            loss = self.criterion(outputs, tgt_output)
 
-        self.criterion = LabelSmoothingLoss(
-            len(self.vocab), padding_idx=self.vocab.pad, smoothing=0.1
-        )
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['trainer']['clip_grad'])
+            self.optimizer.step()
+            
+            # Chỉ process chính cập nhật progress bar và log
+            if self.is_main_process:
+                pbar.update(1)
+                pbar.set_postfix({'loss': loss.item()})
+        
+        pbar.close()
 
-        transforms = None
-        if self.image_aug:
-            transforms = augmentor
-
-        self.train_gen = self.data_gen(
-            "train_{}".format(self.dataset_name),
-            self.data_root,
-            self.train_annotation,
-            self.masked_language_model,
-            transform=transforms,
-        )
-        if self.valid_annotation:
-            self.valid_gen = self.data_gen(
-                "valid_{}".format(self.dataset_name),
-                self.data_root,
-                self.valid_annotation,
-                masked_language_model=False,
-            )
-
-        self.train_losses = []
-
-    def train(self):
-        total_loss = 0
-
-        total_loader_time = 0
-        total_gpu_time = 0
-        best_acc = 0
-
-        data_iter = iter(self.train_gen)
-        for i in range(self.num_iters):
-            self.iter += 1
-
-            start = time.time()
-
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(self.train_gen)
-                batch = next(data_iter)
-
-            total_loader_time += time.time() - start
-
-            start = time.time()
-            loss = self.step(batch)
-            total_gpu_time += time.time() - start
-
-            total_loss += loss
-            self.train_losses.append((self.iter, loss))
-
-            if self.iter % self.print_every == 0:
-                info = "iter: {:06d} - train loss: {:.3f} - lr: {:.2e} - load time: {:.2f} - gpu time: {:.2f}".format(
-                    self.iter,
-                    total_loss / self.print_every,
-                    self.optimizer.param_groups[0]["lr"],
-                    total_loader_time,
-                    total_gpu_time,
-                )
-
-                total_loss = 0
-                total_loader_time = 0
-                total_gpu_time = 0
-                print(info)
-                self.logger.log(info)
-
-            if self.valid_annotation and self.iter % self.valid_every == 0:
-                val_loss = self.validate()
-                acc_full_seq, acc_per_char = self.precision(self.metrics)
-
-                info = "iter: {:06d} - valid loss: {:.3f} - acc full seq: {:.4f} - acc per char: {:.4f}".format(
-                    self.iter, val_loss, acc_full_seq, acc_per_char
-                )
-                print(info)
-                self.logger.log(info)
-
-                if acc_full_seq > best_acc:
-                    self.save_weights(self.export_weights)
-                    best_acc = acc_full_seq
-
-    def validate(self):
+    def validate(self, data_loader):
         self.model.eval()
-
-        total_loss = []
-
+        pbar = tqdm(total=len(data_loader), desc="Validation", disable=not self.is_main_process)
+        
+        total_loss = 0
+        total_correct_chars = 0
+        total_chars = 0
+        total_correct_seqs = 0
+        total_seqs = 0
+        
         with torch.no_grad():
-            for step, batch in enumerate(self.valid_gen):
-                batch = self.batch_to_device(batch)
-                img, tgt_input, tgt_output, tgt_padding_mask = (
-                    batch["img"],
-                    batch["tgt_input"],
-                    batch["tgt_output"],
-                    batch["tgt_padding_mask"],
-                )
+            for i, batch in enumerate(data_loader):
+                img = batch['image'].to(self.device, non_blocking=True)
+                tgt_input = batch['tgt_input'].to(self.device, non_blocking=True)
+                tgt_output = batch['tgt_output'].to(self.device, non_blocking=True)
+                tgt_padding_mask = batch['tgt_padding_mask'].to(self.device, non_blocking=True)
+                tgt_text = batch['tgt_text']
 
                 outputs = self.model(img, tgt_input, tgt_padding_mask)
-                #                loss = self.criterion(rearrange(outputs, 'b t v -> (b t) v'), rearrange(tgt_output, 'b o -> (b o)'))
-
-                outputs = outputs.flatten(0, 1)
-                tgt_output = tgt_output.flatten()
-                loss = self.criterion(outputs, tgt_output)
-
-                total_loss.append(loss.item())
-
-                del outputs
-                del loss
-
-        total_loss = np.mean(total_loss)
-        self.model.train()
-
-        return total_loss
-
-    def predict(self, sample=None):
-        pred_sents = []
-        actual_sents = []
-        img_files = []
-
-        for batch in self.valid_gen:
-            batch = self.batch_to_device(batch)
-
-            if self.beamsearch:
-                translated_sentence = batch_translate_beam_search(
-                    batch["img"], self.model
+                
+                loss = self.criterion(
+                    outputs.view(-1, outputs.size(2)),
+                    tgt_output.view(-1)
                 )
-                prob = None
-            else:
-                translated_sentence, prob = translate(batch["img"], self.model)
 
-            pred_sent = self.vocab.batch_decode(translated_sentence.tolist())
-            actual_sent = self.vocab.batch_decode(batch["tgt_output"].tolist())
+                # model gốc khi dùng DDP
+                model_to_eval = self.model.module if self.is_distributed else self.model
+                
+                if self.config['beamsearch']:
+                    s = model_to_eval.beam_search(img, self.config)
+                else:
+                    s = model_to_eval.greedy_search(img, self.config)
+                
+                batch_correct_chars, batch_total_chars, batch_correct_seqs = self.calculate_acc(s, tgt_text)
 
-            img_files.extend(batch["filenames"])
+                total_loss += loss.item() * len(tgt_text)
+                total_correct_chars += batch_correct_chars
+                total_chars += batch_total_chars
+                total_correct_seqs += batch_correct_seqs
+                total_seqs += len(tgt_text)
 
-            pred_sents.extend(pred_sent)
-            actual_sents.extend(actual_sent)
+                pbar.update(1)
+        
+        pbar.close()
+        
+        # Đồng bộ hóa metrics từ tất cả các GPU
+        if self.is_distributed:
+            metrics_tensor = torch.tensor([total_loss, total_correct_chars, total_chars, total_correct_seqs, total_seqs]).to(self.device)
+            dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+            total_loss, total_correct_chars, total_chars, total_correct_seqs, total_seqs = metrics_tensor.tolist()
 
-            if sample != None and len(pred_sents) > sample:
-                break
+        # Chỉ process chính tính toán và log kết quả cuối cùng
+        if self.is_main_process:
+            val_loss = total_loss / total_seqs
+            char_acc = total_correct_chars / total_chars
+            full_seq_acc = total_correct_seqs / total_seqs
+            
+            self.logger.info('Validation loss: %.4f - char_acc: %.4f - full_seq_acc: %.4f' % (val_loss, char_acc, full_seq_acc))
+            self.metrics = {'val_loss': val_loss, 'char_acc': char_acc, 'full_seq_acc': full_seq_acc}
 
-        return pred_sents, actual_sents, img_files, prob
+    def calculate_acc(self, pred, target):
+        correct_chars = 0
+        total_chars = 0
+        correct_seqs = 0
+        
+        for i in range(len(target)):
+            if pred[i] == target[i]:
+                correct_seqs += 1
+            
+            for j in range(min(len(pred[i]), len(target[i]))):
+                if pred[i][j] == target[i][j]:
+                    correct_chars += 1
+            total_chars += len(target[i])
+            
+        return correct_chars, total_chars, correct_seqs
 
-    def precision(self, sample=None):
+    def save(self, checkpoint_path):
+        if not self.is_main_process:
+            return
 
-        pred_sents, actual_sents, _, _ = self.predict(sample=sample)
-
-        acc_full_seq = compute_accuracy(actual_sents, pred_sents, mode="full_sequence")
-        acc_per_char = compute_accuracy(actual_sents, pred_sents, mode="per_char")
-
-        return acc_full_seq, acc_per_char
-
-    def visualize_prediction(
-        self, sample=16, errorcase=False, fontname="serif", fontsize=16
-    ):
-
-        pred_sents, actual_sents, img_files, probs = self.predict(sample)
-
-        if errorcase:
-            wrongs = []
-            for i in range(len(img_files)):
-                if pred_sents[i] != actual_sents[i]:
-                    wrongs.append(i)
-
-            pred_sents = [pred_sents[i] for i in wrongs]
-            actual_sents = [actual_sents[i] for i in wrongs]
-            img_files = [img_files[i] for i in wrongs]
-            probs = [probs[i] for i in wrongs]
-
-        img_files = img_files[:sample]
-
-        fontdict = {"family": fontname, "size": fontsize}
-
-        for vis_idx in range(0, len(img_files)):
-            img_path = img_files[vis_idx]
-            pred_sent = pred_sents[vis_idx]
-            actual_sent = actual_sents[vis_idx]
-            prob = probs[vis_idx]
-
-            img = Image.open(open(img_path, "rb"))
-            plt.figure()
-            plt.imshow(img)
-            plt.title(
-                "prob: {:.3f} - pred: {} - actual: {}".format(
-                    prob, pred_sent, actual_sent
-                ),
-                loc="left",
-                fontdict=fontdict,
-            )
-            plt.axis("off")
-
-        plt.show()
-
-    def visualize_dataset(self, sample=16, fontname="serif"):
-        n = 0
-        for batch in self.train_gen:
-            for i in range(self.batch_size):
-                img = batch["img"][i].numpy().transpose(1, 2, 0)
-                sent = self.vocab.decode(batch["tgt_input"].T[i].tolist())
-
-                plt.figure()
-                plt.title("sent: {}".format(sent), loc="center", fontname=fontname)
-                plt.imshow(img)
-                plt.axis("off")
-
-                n += 1
-                if n >= sample:
-                    plt.show()
-                    return
-
-    def load_checkpoint(self, filename):
-        checkpoint = torch.load(filename)
-
-        optim = ScheduledOptim(
-            Adam(self.model.parameters(), betas=(0.9, 0.98), eps=1e-09),
-            self.config["transformer"]["d_model"],
-            **self.config["optimizer"]
-        )
-
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.model.load_state_dict(checkpoint["state_dict"])
-        self.iter = checkpoint["iter"]
-
-        self.train_losses = checkpoint["train_losses"]
-
-    def save_checkpoint(self, filename):
+        # Khi dùng DDP, model được bọc trong module
+        state_dict = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
+        
         state = {
-            "iter": self.iter,
-            "state_dict": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "train_losses": self.train_losses,
+            'model': state_dict,
+            'optimizer': self.optimizer.state_dict(),
+            'metrics': self.metrics,
+            'epoch': self.epoch,
+            'step': self.step,
+            'best_acc': self.best_acc,
         }
+        torch.save(state, checkpoint_path)
+        self.logger.info('Saving checkpoint: %s' % checkpoint_path)
 
-        path, _ = os.path.split(filename)
-        os.makedirs(path, exist_ok=True)
+    def load(self, checkpoint_path):
+        if 'http' in checkpoint_path:
+            checkpoint_path = download_file(checkpoint_path, self.checkpoint_dir)
+        
+        # Ánh xạ checkpoint đến đúng GPU của process hiện tại
+        map_location = f'cuda:{self.local_rank}' if self.is_distributed else self.device
 
-        torch.save(state, filename)
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+        
+        saved_state_dict = checkpoint['model']
+        new_state_dict = OrderedDict()
+        
+        # Xử lý prefix 'module.' khi load checkpoint DDP vào model thường hoặc ngược lại
+        is_ddp_model = isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+        saved_is_ddp = all([k.startswith('module.') for k in saved_state_dict.keys()])
 
-    def load_weights(self, filename):
-        state_dict = torch.load(filename, map_location=torch.device(self.device))
+        if is_ddp_model and not saved_is_ddp:
+            # model hiện tại là DDP, checkpoint không phải -> thêm prefix
+            for k, v in saved_state_dict.items():
+                name = 'module.' + k
+                new_state_dict[name] = v
+        elif not is_ddp_model and saved_is_ddp:
+            # model hiện tại không phải DDP, checkpoint là DDP -> bỏ prefix
+            for k, v in saved_state_dict.items():
+                name = k[7:] # remove `module.`
+                new_state_dict[name] = v
+        else: # Cả hai cùng là DDP hoặc cùng không phải
+            new_state_dict = saved_state_dict
 
-        for name, param in self.model.named_parameters():
-            if name not in state_dict:
-                print("{} not found".format(name))
-            elif state_dict[name].shape != param.shape:
-                print(
-                    "{} missmatching shape, required {} but found {}".format(
-                        name, param.shape, state_dict[name].shape
-                    )
-                )
-                del state_dict[name]
+        self.model.load_state_dict(new_state_dict)
 
-        self.model.load_state_dict(state_dict, strict=False)
-
-    def save_weights(self, filename):
-        path, _ = os.path.split(filename)
-        os.makedirs(path, exist_ok=True)
-
-        torch.save(self.model.state_dict(), filename)
-
-    def batch_to_device(self, batch):
-        img = batch["img"].to(self.device, non_blocking=True)
-        tgt_input = batch["tgt_input"].to(self.device, non_blocking=True)
-        tgt_output = batch["tgt_output"].to(self.device, non_blocking=True)
-        tgt_padding_mask = batch["tgt_padding_mask"].to(self.device, non_blocking=True)
-
-        batch = {
-            "img": img,
-            "tgt_input": tgt_input,
-            "tgt_output": tgt_output,
-            "tgt_padding_mask": tgt_padding_mask,
-            "filenames": batch["filenames"],
-        }
-
-        return batch
-
-    def data_gen(
-        self,
-        lmdb_path,
-        data_root,
-        annotation,
-        masked_language_model=True,
-        transform=None,
-    ):
-        dataset = OCRDataset(
-            lmdb_path=lmdb_path,
-            root_dir=data_root,
-            annotation_path=annotation,
-            vocab=self.vocab,
-            transform=transform,
-            image_height=self.config["dataset"]["image_height"],
-            image_min_width=self.config["dataset"]["image_min_width"],
-            image_max_width=self.config["dataset"]["image_max_width"],
-        )
-
-        sampler = ClusterRandomSampler(dataset, self.batch_size, True)
-        collate_fn = Collator(masked_language_model)
-
-        gen = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            sampler=sampler,
-            collate_fn=collate_fn,
-            shuffle=False,
-            drop_last=False,
-            **self.config["dataloader"]
-        )
-
-        return gen
-
-    def data_gen_v1(self, lmdb_path, data_root, annotation):
-        data_gen = DataGen(
-            data_root,
-            annotation,
-            self.vocab,
-            "cpu",
-            image_height=self.config["dataset"]["image_height"],
-            image_min_width=self.config["dataset"]["image_min_width"],
-            image_max_width=self.config["dataset"]["image_max_width"],
-        )
-
-        return data_gen
-
-    def step(self, batch):
-        self.model.train()
-
-        batch = self.batch_to_device(batch)
-        img, tgt_input, tgt_output, tgt_padding_mask = (
-            batch["img"],
-            batch["tgt_input"],
-            batch["tgt_output"],
-            batch["tgt_padding_mask"],
-        )
-
-        outputs = self.model(img, tgt_input, tgt_key_padding_mask=tgt_padding_mask)
-        #        loss = self.criterion(rearrange(outputs, 'b t v -> (b t) v'), rearrange(tgt_output, 'b o -> (b o)'))
-        outputs = outputs.view(-1, outputs.size(2))  # flatten(0, 1)
-        tgt_output = tgt_output.view(-1)  # flatten()
-
-        loss = self.criterion(outputs, tgt_output)
-
-        self.optimizer.zero_grad()
-
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
-
-        self.optimizer.step()
-        self.scheduler.step()
-
-        loss_item = loss.item()
-
-        return loss_item
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.epoch = checkpoint.get('epoch', 1)
+        self.step = checkpoint.get('step', 0)
+        self.best_acc = checkpoint.get('best_acc', 0)
+        
+        if self.is_main_process:
+            self.logger.info('Loading checkpoint from %s' % checkpoint_path)
