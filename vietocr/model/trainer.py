@@ -385,7 +385,7 @@ class Trainer:
             sampler=sampler,
             collate_fn=collate_fn,
             shuffle=False,
-            drop_last=False,
+            drop_last=True,
             **self.config["dataloader"]
         )
 
