@@ -33,6 +33,14 @@ class Trainer:
         self.model, self.vocab = build_model(config)
 
         self.device = config["device"]
+        self.multi_gpu = config['trainer'].get('multi_gpu', False)
+
+        if self.multi_gpu and torch.cuda.device_count() > 1:
+            print("Sử dụng", torch.cuda.device_count(), "GPU!")
+            self.model = nn.DataParallel(self.model)
+        
+        self.model.to(self.device)
+
         self.num_iters = config["trainer"]["iters"]
         self.beamsearch = config["predictor"]["beamsearch"]
 
@@ -299,10 +307,10 @@ class Trainer:
 
     def save_checkpoint(self, filename):
         state = {
-            "iter": self.iter,
-            "state_dict": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "train_losses": self.train_losses,
+            'iter': self.iter,
+            'state_dict': self.model.module.state_dict() if self.multi_gpu else self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'train_losses': self.train_losses,
         }
 
         path, _ = os.path.split(filename)
@@ -329,8 +337,9 @@ class Trainer:
     def save_weights(self, filename):
         path, _ = os.path.split(filename)
         os.makedirs(path, exist_ok=True)
-
-        torch.save(self.model.state_dict(), filename)
+        
+        state_dict = self.model.module.state_dict() if self.multi_gpu else self.model.state_dict()
+        torch.save(state_dict, filename)
 
     def batch_to_device(self, batch):
         img = batch["img"].to(self.device, non_blocking=True)
