@@ -36,7 +36,7 @@ class VietOCR(nn.Module):
         # Dùng .get() để an toàn nếu key không tồn tại
         tgt_key_padding_mask = batch.get('tgt_padding_mask', None)
         src = self.cnn(img)
-
+        src = src.permute(1, 0, 2)
         if self.seq_modeling == "transformer":
             outputs = self.transformer(
                 src, tgt_input, tgt_key_padding_mask=tgt_key_padding_mask
